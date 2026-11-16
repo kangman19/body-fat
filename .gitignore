@@ -1,0 +1,35 @@
+# Third-party repos cloned in (own .git, with multi-GB checkpoints)
+/anny/
+/sam-3d-body/
+
+# Datasets and downloaded model weights
+/data/
+/models/
+
+# Caches and generated output
+/.anny_cache/
+/outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Weights and large binaries, wherever they appear
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.npz
+*.XPT
+
+# Env and editor
+.env
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Body Morph Test</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1d2026; --line: #2e333c; --text: #e8eaee; --muted: #9aa1ad;
+    --accent: #e0a36b; --accent-ink: #1b1206; --warn: #f0c36a; --stage: #23272e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI", system-ui, sans-serif;
+         display: grid; grid-template-columns: 360px 1fr; }
+  aside { background: var(--panel); border-right: 1px solid var(--line); padding: 20px; overflow-y: auto; }
+  h1 { font-size: 17px; margin: 0 0 2px; letter-spacing: .2px; }
+  .sub { color: var(--muted); margin: 0 0 18px; font-size: 12.5px; }
+  h2 { font-size: 11.5px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted);
+       margin: 22px 0 10px; padding-top: 16px; border-top: 1px solid var(--line); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input[type=file] { width: 100%; font: inherit; font-size: 12.5px; color: var(--muted); }
+  input[type=number], select { width: 100%; padding: 8px 9px; background: var(--bg); color: var(--text);
+       border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+  input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button { width: 100%; margin-top: 12px; padding: 10px; border: 0; border-radius: 6px; cursor: pointer;
+       background: var(--accent); color: var(--accent-ink); font: 600 14px/1 inherit; }
+  button:disabled, input:disabled { opacity: .45; cursor: not-allowed; }
+  input[type=range] { width: 100%; accent-color: var(--accent); margin: 4px 0 0; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; }
+  .val { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .ends { display: flex; justify-content: space-between; color: var(--muted); font-size: 11.5px; }
+  .note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  .note.warn { color: var(--warn); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td { padding: 5px 0; border-bottom: 1px solid var(--line); }
+  td:nth-child(2), td:nth-child(3) { text-align: right; }
+  td:nth-child(3) { color: var(--muted); width: 70px; }
+  td.up { color: #e58f7a; } td.down { color: #7fc7a0; }
+  .big { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+  .big div { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; }
+  .big b { display: block; font-size: 19px; font-variant-numeric: tabular-nums; }
+  .big span { color: var(--muted); font-size: 11.5px; }
+  main { position: relative; background: var(--stage); min-width: 0; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #photoPane { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+       gap: 14px; padding: 56px 16px 48px; background: var(--stage); }
+  #photoPane figure { margin: 0; min-width: 0; max-height: 100%; display: flex; flex-direction: column; }
+  #photoPane img { max-width: 100%; max-height: calc(100vh - 150px); border-radius: 6px; display: block; }
+  #photoPane figcaption { color: var(--muted); font-size: 12px; padding-top: 6px; text-align: center; }
+  #tabs { position: absolute; left: 16px; top: 14px; display: none; gap: 6px; z-index: 2; }
+  #tabs button { width: auto; margin: 0; padding: 7px 12px; background: rgba(0,0,0,.45); color: var(--text); font-weight: 500; }
+  #tabs button[aria-pressed=true] { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  #status { position: absolute; left: 16px; bottom: 14px; padding: 7px 11px; border-radius: 6px;
+       background: rgba(0,0,0,.45); color: var(--text); font-size: 12.5px; z-index: 2; }
+  #status.busy::before { content: ""; display: inline-block; width: 9px; height: 9px; margin-right: 8px;
+       border: 2px solid var(--accent); border-top-color: transparent; border-radius: 50%;
+       animation: spin .8s linear infinite; vertical-align: -1px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #hint { position: absolute; right: 16px; bottom: 14px; color: var(--muted); font-size: 12px; }
+  @media (max-width: 800px) { body { grid-template-columns: 1fr; grid-template-rows: auto 60vh; } }
+</style>
+<script type="importmap">
+  { "imports": { "three": "/static/vendor/three.module.js" } }
+</script>
+</head>
+<body>
+<aside>
+  <h1>Body Morph Test</h1>
+  <p class="sub">Runs only on this computer.</p>
+
+  <form id="form">
+    <div class="grid">
+      <div><label for="height">Height (cm)</label><input id="height" type="number" min="130" max="220" step="0.5" value="178" required></div>
+      <div><label for="weight">Weight (kg)</label><input id="weight" type="number" min="35" max="200" step="0.5" value="78" required></div>
+      <div><label for="sex">Sex</label><select id="sex"><option value="male">Male</option><option value="female">Female</option></select></div>
+      <div><label for="age">Age</label><input id="age" type="number" min="18" max="90" step="1" value="30" required></div>
+    </div>
+    <button id="submit" type="submit">Generate body from these numbers</button>
+
+    <h2>Or use photos</h2>
+    <label for="front">Front photo</label><input id="front" type="file" accept="image/*">
+    <label for="side" style="margin-top:10px">Side photo (optional)</label><input id="side" type="file" accept="image/*">
+    <button id="photoBtn" type="button">Build body from photos</button>
+    <p class="note">Stand upright, whole body in frame, arms slightly away from your sides, fitted clothing. Uses the height, weight, sex and age above. Takes several minutes on this computer. Photos stay on this computer and are not saved.</p>
+  </form>
+
+  <h2>Body fat</h2>
+  <div class="big"><div style="grid-column: 1 / -1"><b id="bf">-</b><span id="bfNote">estimated body fat range</span></div></div>
+  <div class="row"><label for="fat">Explore body fat</label><span class="val" id="fatVal">-</span></div>
+  <input id="fat" type="range" step="0.5" disabled>
+  <div class="ends"><span id="fatMin">lower</span><span id="fatMax">higher</span></div>
+  <p class="note">Release the slider to reshape the body. Takes about a minute. Height stays fixed. Each change starts from the body you generated.</p>
+  <p class="note warn">An estimate, not a medical measurement.</p>
+
+  <h2>Measurements</h2>
+  <div class="big">
+    <div><b id="kg">-</b><span>estimated weight (kg)</span></div>
+    <div><b id="bmi">-</b><span>BMI</span></div>
+  </div>
+  <table id="girths"></table>
+  <p class="note">Change column compares with the body you generated.</p>
+</aside>
+
+<main>
+  <div id="tabs">
+    <button id="tab3d" type="button" aria-pressed="true">3D model</button>
+    <button id="tabPhoto" type="button" aria-pressed="false">Photo view</button>
+  </div>
+  <canvas id="view"></canvas>
+  <div id="photoPane">
+    <figure><img id="photoBefore" alt="Original photo"><figcaption>Original photo</figcaption></figure>
+    <figure><img id="photoAfter" alt="Photo re-drawn for the current body"><figcaption id="photoAfterCap">Current body</figcaption></figure>
+  </div>
+  <div id="status">Loading...</div>
+  <div id="hint">Drag to rotate, scroll to zoom</div>
+</main>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from '/static/vendor/OrbitControls.js';
+
+const $ = id => document.getElementById(id);
+const LABELS = {
+  waist: 'Waist (ISO, narrowest)', waist_iliac: 'Waist (NHANES, hip bone)', waist_navel: 'Waist (navel)',
+  hip: 'Hip', chest: 'Chest', thigh: 'Thigh', calf: 'Calf', bicep: 'Upper arm (relaxed)', wrist: 'Wrist',
+};
+let reliefRangeM = 0.005, normalScaleFull = 0.45;   // replaced by the server's values at start
+
+// ---------- 3D scene
+const canvas = $('view');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x23272e);
+const camera = new THREE.PerspectiveCamera(35, 1, 0.05, 50);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x3a3f48, 1.3));
+const key = new THREE.DirectionalLight(0xffffff, 1.5); key.position.set(2, 3, 3); scene.add(key);
+const rim = new THREE.DirectionalLight(0xffffff, 0.6); rim.position.set(-3, 2, -2); scene.add(rim);
+const floor = new THREE.Mesh(new THREE.CircleGeometry(1.1, 64),
+  new THREE.MeshStandardMaterial({ color: 0x1b1e23, roughness: 1 }));
+floor.rotation.x = -Math.PI / 2; scene.add(floor);
+
+// The skin image (clay or baked photo) and the relief maps all use Anny's UV layout.
+// Muscle relief is never colour: it is vertex displacement plus a matching normal map,
+// both scaled by the "relief" value the server sends for the current body fat.
+const geometry = new THREE.BufferGeometry();
+const skin = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.52, metalness: 0 });
+const mesh = new THREE.Mesh(geometry, skin);
+mesh.visible = false; scene.add(mesh);
+
+function resize() {
+  const { clientWidth: w, clientHeight: h } = canvas.parentElement;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+
+const decode = (b64, Type) => new Type(Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer);
+const loadTexture = url => new Promise((resolve, reject) =>
+  new THREE.TextureLoader().load(url, resolve, undefined, reject));
+
+// ---------- mesh layout (sent once)
+let faces = null;        // triangles over the real mesh vertices (for smooth normals)
+let uvToVertex = null;   // expanded vertex -> real mesh vertex (texture seams split vertices)
+let parents1 = null, parents2 = null;   // each finer vertex is the average of two parents
+
+// One split level: out[i] = average of the two parent values.
+function refine(values, parents, stride) {
+  const count = parents.length / 2, out = new Float32Array(count * stride);
+  for (let i = 0; i < count; i++) {
+    const a = parents[2 * i] * stride, b = parents[2 * i + 1] * stride, t = i * stride;
+    for (let k = 0; k < stride; k++) out[t + k] = (values[a + k] + values[b + k]) * 0.5;
+  }
+  return out;
+}
+
+function setVertices(positions) {
+  const count = uvToVertex.length, real = positions.length / 3;
+  // Smooth normals on the real mesh, so texture seams do not show as creases.
+  const normals = new Float32Array(real * 3);
+  for (let i = 0; i < faces.length; i += 3) {
+    const a = faces[i] * 3, b = faces[i + 1] * 3, c = faces[i + 2] * 3;
+    const ux = positions[b] - positions[a], uy = positions[b + 1] - positions[a + 1], uz = positions[b + 2] - positions[a + 2];
+    const vx = positions[c] - positions[a], vy = positions[c + 1] - positions[a + 1], vz = positions[c + 2] - positions[a + 2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    for (const k of [a, b, c]) { normals[k] += nx; normals[k + 1] += ny; normals[k + 2] += nz; }
+  }
+  const pos = new Float32Array(count * 3), nor = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    const s = uvToVertex[i] * 3, t = i * 3;
+    pos[t] = positions[s]; pos[t + 1] = positions[s + 1]; pos[t + 2] = positions[s + 2];
+    const len = Math.hypot(normals[s], normals[s + 1], normals[s + 2]) || 1;
+    nor[t] = normals[s] / len; nor[t + 1] = normals[s + 1] / len; nor[t + 2] = normals[s + 2] / len;
+  }
+  // Split twice so displacement has enough vertices to shape small muscle contours.
+  const finePos = refine(refine(pos, parents1, 3), parents2, 3);
+  const fineNor = refine(refine(nor, parents1, 3), parents2, 3);
+  geometry.setAttribute('position', new THREE.BufferAttribute(finePos, 3));
+  geometry.setAttribute('normal', new THREE.BufferAttribute(fineNor, 3));
+  geometry.computeBoundingSphere();
+}
+
+// ---------- state
+let person = null;      // sex, age, height_cm of the generated body
+let current = null;     // last server reply
+let start = null;       // weight, dials and sliders of the generated body
+let baseline = null;    // girths of the generated body, for the change column
+let fromPhoto = false;
+let framed = false;
+
+function setStatus(text, busy = false) {
+  $('status').textContent = text; $('status').classList.toggle('busy', busy);
+}
+function setBusy(busy) {
+  for (const id of ['submit', 'photoBtn', 'fat']) $(id).disabled = busy || (id === 'fat' && !current);
+}
+function showTab(photo) {
+  $('photoPane').style.display = photo ? 'flex' : 'none';
+  $('hint').style.display = photo ? 'none' : '';
+  $('tab3d').setAttribute('aria-pressed', String(!photo));
+  $('tabPhoto').setAttribute('aria-pressed', String(photo));
+}
+$('tab3d').addEventListener('click', () => showTab(false));
+$('tabPhoto').addEventListener('click', () => showTab(true));
+
+async function show(reply) {
+  current = reply;
+  setVertices(decode(reply.vertices, Float32Array));
+  const texture = await loadTexture(reply.texture);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  if (skin.map) skin.map.dispose();
+  skin.map = texture;
+  const relief = reply.relief;
+  skin.displacementScale = 2 * reliefRangeM * relief;     // map 0..1 spans -range..+range
+  skin.displacementBias = -reliefRangeM * relief;
+  skin.normalScale.set(normalScaleFull * relief, normalScaleFull * relief);
+  skin.needsUpdate = true;
+  mesh.visible = true;
+  if (!framed) {
+    const h = person.height_cm / 100;
+    controls.target.set(0, h / 2, 0); camera.position.set(0, h * 0.55, h * 2.3); framed = true;
+  }
+  if (reply.photo_view) {
+    $('photoAfter').src = reply.photo_view;
+    $('photoAfterCap').textContent = `About ${reply.bf_mid.toFixed(0)}% body fat`;
+  }
+  $('kg').textContent = reply.weight_kg.toFixed(1);
+  $('bmi').textContent = reply.bmi.toFixed(1);
+  $('girths').innerHTML = Object.entries(reply.girths_mm).map(([k, mm]) => {
+    const d = baseline ? mm - baseline[k] : 0;
+    const cls = d > 0 ? 'up' : d < 0 ? 'down' : '';
+    return `<tr><td>${LABELS[k] || k}</td><td>${mm} mm</td><td class="${cls}">${d > 0 ? '+' : ''}${d || ''}</td></tr>`;
+  }).join('');
+  $('bf').textContent = `${reply.bf_range[0].toFixed(0)} to ${reply.bf_range[1].toFixed(0)}%`;
+  $('fat').min = reply.bf_floor; $('fat').max = reply.bf_ceiling;
+  $('fatMin').textContent = reply.bf_floor + '%'; $('fatMax').textContent = reply.bf_ceiling + '%';
+  $('fat').value = reply.bf_mid; $('fatVal').textContent = (+$('fat').value).toFixed(1) + '%';
+}
+
+async function call(path, body, message) {
+  setBusy(true); setStatus(message, true);
+  try {
+    const isForm = body instanceof FormData;
+    const res = await fetch(path, { method: 'POST', body: isForm ? body : JSON.stringify(body),
+                                    headers: isForm ? {} : { 'Content-Type': 'application/json' } });
+    if (!res.ok) {
+      const text = await res.text();
+      let detail = text.slice(0, 200);
+      try { const d = JSON.parse(text).detail; if (typeof d === 'string') detail = d; } catch {}
+      throw new Error(detail);
+    }
+    return await res.json();
+  } catch (err) {
+    setStatus('Something went wrong: ' + err.message); return null;
+  } finally { setBusy(false); }
+}
+
+async function started(reply, note) {
+  baseline = reply.girths_mm;
+  start = { weight_kg: +$('weight').value, dials: reply.dials, local: reply.local };
+  framed = false;
+  await show(reply); setBusy(false); $('bfNote').textContent = note;
+}
+
+// ---------- controls
+$('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  person = { sex: $('sex').value, age: +$('age').value, height_cm: +$('height').value };
+  const reply = await call('/api/body', { ...person, weight_kg: +$('weight').value }, 'Generating body...');
+  if (!reply) return;
+  fromPhoto = false; $('tabs').style.display = 'none'; showTab(false);
+  await started(reply, 'estimated body fat range (generic body)');
+  setStatus(`Generated in ${reply.seconds}s`);
+});
+
+$('photoBtn').addEventListener('click', async () => {
+  if (!$('form').reportValidity()) return;
+  if (!$('front').files[0]) { setStatus('Choose a front photo first'); return; }
+  person = { sex: $('sex').value, age: +$('age').value, height_cm: +$('height').value };
+  const form = new FormData();
+  for (const [k, v] of Object.entries({ ...person, weight_kg: +$('weight').value })) form.append(k, v);
+  form.append('front', $('front').files[0]);
+  if ($('side').files[0]) form.append('side', $('side').files[0]);
+  const reply = await call('/api/photo', form, 'Reading the photos. This takes several minutes...');
+  if (!reply) return;
+  fromPhoto = true;
+  $('photoBefore').src = reply.photo_view;
+  $('tabs').style.display = 'flex';
+  await started(reply, 'estimated body fat range (from photos)');
+  setStatus(`Built from ${reply.photos_used} photo${reply.photos_used > 1 ? 's' : ''} in ${Math.round(reply.seconds)}s`);
+});
+
+$('fat').addEventListener('input', () => { $('fatVal').textContent = (+$('fat').value).toFixed(1) + '%'; });
+$('fat').addEventListener('change', async () => {
+  const target = +$('fat').value;
+  const reply = await call('/api/bodyfat', { ...person, ...start, from_photo: fromPhoto, target_bf: target },
+    `Reshaping to about ${target}% body fat. About a minute...`);
+  if (!reply) return;
+  await show(reply); $('bfNote').textContent = 'body fat range this body was shaped for';
+  setStatus(`Reshaped in ${reply.seconds}s`);
+});
+
+// ---------- start
+const info = await (await fetch('/api/faces')).json();
+faces = decode(info.faces, Uint32Array);
+uvToVertex = decode(info.uv_to_vertex, Uint32Array);
+parents1 = decode(info.parents1, Uint32Array);
+parents2 = decode(info.parents2, Uint32Array);
+reliefRangeM = info.relief_range_m; normalScaleFull = info.normal_scale_full;
+geometry.setIndex(new THREE.BufferAttribute(decode(info.fine_faces, Uint32Array), 1));
+geometry.setAttribute('uv', new THREE.BufferAttribute(decode(info.fine_uv, Float32Array), 2));
+skin.normalMap = await loadTexture(info.normal);
+skin.displacementMap = await loadTexture(info.displacement);
+skin.displacementScale = 0; skin.normalScale.set(0, 0);
+setStatus('Enter details and press Generate body');
+</script>
+</body>
+</html>
