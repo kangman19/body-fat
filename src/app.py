@@ -6,8 +6,8 @@ loads three.js from src/static/vendor, not from the internet.
 Endpoints
     GET  /api/faces     triangle list (sent once)
     POST /api/body      height, weight, sex, age -> generic Anny body + body fat estimate
-    POST /api/photo     photo(s) + height, weight, sex, age -> Anny body fitted to the photo,
-                        textured, plus the photo re-drawn for that body
+    POST /api/photo     photo(s) + height, weight, sex, age -> Anny body fitted to the photo
+                        (drawn as clay), plus the photo re-drawn for that body
     POST /api/bodyfat   that body + a chosen body fat % -> morphed body (stages 3 + 4)
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ from stage2_measure import DIAL_RANGES, AnnyBody  # noqa: E402
 import stage1_mesh as stage1  # noqa: E402
 import stage3_nhanes as stage3  # noqa: E402
 import stage5_photoreal as stage5  # noqa: E402
-from stage4_morph import fixed_for_bf, muscle_dial_for_bf, relief, solve  # noqa: E402
+from stage4_morph import FRAME_DIALS, fixed_for_bf, relief, solve  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -75,15 +75,18 @@ def _jpeg(image_rgb, quality=90):
     return "data:image/jpeg;base64," + base64.b64encode(data.tobytes()).decode()
 
 
-def _payload(person: Person, dials, local, body, started, bf=None, texture=None):
+def _payload(person: Person, dials, local, body, started, bf=None, measured_shape=False):
     """Everything the page needs to draw and describe one body."""
     with torch.no_grad():
-        girths = {k: float(x) for k, x in anny_body.measure(body).items()}
+        girths = {k: float(x) for k, x in anny_body.measure(body, full=True).items()}
     v = body["vertices"].detach().numpy()
     mass = float(body["mass_kg"])
-    half = bf_model[person.sex]["rmse"]
+    half = stage3.BF_RANGE_HALF
+    bf_nhanes = None
     if bf is None:  # no chosen value: estimate it from the measurements
-        bf = stage3.estimate_bf(bf_model, person.sex, person.age, person.height_cm, mass, girths)["bf_mid"]
+        est = stage3.estimate_bf(bf_model, person.sex, person.age, person.height_cm, mass, girths,
+                                 muscle_dial=float(dials["muscle"]), measured_shape=measured_shape)
+        bf, bf_nhanes = est["bf_mid"], est["bf_nhanes"]
     return {
         "vertices": _b64(np.stack([v[:, 0], v[:, 2], -v[:, 1]], axis=1), np.float32),  # Y-up
         "dials": {k: float(x) for k, x in dials.items()},
@@ -92,14 +95,15 @@ def _payload(person: Person, dials, local, body, started, bf=None, texture=None)
         "bmi": round(mass / (person.height_cm / 100) ** 2, 1),
         "girths_mm": {k: round(x) for k, x in girths.items()},
         "bf_mid": round(bf, 1),
-        "bf_range": [round(bf - half, 1), round(bf + half, 1)],
-        "bf_floor": bf_model[person.sex]["bf_floor"],
+        # +/- BF_RANGE_HALF, never past the slider's floor or ceiling
+        "bf_range": [round(max(bf - half, stage3.BF_FLOOR[person.sex]), 1),
+                     round(min(bf + half, stage3.BF_CEILING[person.sex]), 1)],
+        "bf_nhanes": bf_nhanes,   # NHANES tape model alone, before the build rule (estimates only)
+        "bf_floor": stage3.BF_FLOOR[person.sex],
         "bf_ceiling": stage3.BF_CEILING[person.sex],
-        # Skin image in Anny's UV layout: plain clay unless a photo texture is given.
-        # "relief" (0..1) is the strength of muscle relief for this sex and body fat;
-        # the viewer uses it for vertex displacement and for the normal map.
+        # The viewer draws every body as clay. "relief" (0..1) is the strength of muscle
+        # relief for this sex and body fat; it scales the displacement and normal map.
         "relief": round(relief(person.sex, bf), 3),
-        "texture": _jpeg(texture if texture is not None else appearance.clay()),
         "seconds": round(time.time() - started, 1),
     }
 
@@ -149,28 +153,28 @@ def photo_body(
     height_cm: float = Form(...), weight_kg: float = Form(...),
 ):
     """Photos are read into memory and never written to disk. The latest photo is kept
-    in memory (photo_session) so it can be re-drawn when the slider moves."""
+    in memory (photo_session) so it can be re-drawn when the slider moves. Nothing from
+    the photo is painted onto the 3D body."""
     global photo_session
     started = time.time()
     try:
         req = BodyRequest(sex=sex, age=age, height_cm=height_cm, weight_kg=weight_kg)
-        images = [stage1.decode_image(f.file.read()) for f in (front, side) if f is not None]
+        files = [f.file.read() for f in (front, side) if f is not None]
+        images = [stage1.decode_image(data) for data in files]
+        cutout = stage1.decode_cutout(files[0])
         with lock:
             # SAM 3D Body is loaded for this photo only and freed as soon as it has read
             # it, so the big models are never all in memory together.
             print("Loading SAM 3D Body (about 40 seconds)...")
             fit = stage1.fit_from_photos(stage1.SamBody(), anny_body, bf_model, images, req.height_cm,
-                                         req.weight_kg, req.sex, req.age, log=print)
+                                         req.weight_kg, req.sex, req.age, log=print, cutout=cutout)
             gc.collect()
             start_relief = relief(req.sex, fit["bf_mid"])
-            print("Painting the photo onto the body and removing the person from the background...")
+            print("Removing the person from the background...")
             view = stage5.PhotoView(images[0], fit["mask"], fit["skin"], fit["photo_pose"], anny_body,
-                                    fit["posed_vertices"], appearance)
-            texture, skin_texels, _ = appearance.bake_photo(
-                images[0], fit["mask"], fit["skin"], view.start_xy, view.facing, fit["face_colour"])
-            photo_session = {"view": view, "texture": texture, "skin_texels": skin_texels,
-                             "pose": fit["pose"], "trans": fit["trans"], "relief": start_relief}
-            reply = _payload(req, fit["dials"], fit["local"], fit["body"], started, texture=texture)
+                                    fit["posed_vertices"], appearance, keypoints=fit["neutral"][1])
+            photo_session = {"view": view, "pose": fit["pose"], "trans": fit["trans"], "relief": start_relief}
+            reply = _payload(req, fit["dials"], fit["local"], fit["body"], started, measured_shape=True)
             reply["photo_view"] = _jpeg(view.render(fit["posed_vertices"], start_relief, start_relief), 93)
             reply["fit_report"] = fit["report"]
             reply["surface_error_mm"] = round(fit["surface_error_mm"], 1)
@@ -188,32 +192,30 @@ def body_fat(req: BodyFatRequest):
         dials = _clamp(req.dials)
         with torch.no_grad():
             start = anny_body.build(req.sex, req.age, req.height_cm, dials, req.local)
-            girths = {k: float(x) for k, x in anny_body.measure(start).items()}
+            girths = {k: float(x) for k, x in anny_body.measure(start, full=True).items()}
             start_mass = float(start["mass_kg"])
-        start_bf = stage3.estimate_bf(bf_model, req.sex, req.age, req.height_cm, start_mass, girths)["bf_mid"]
+        start_bf = stage3.estimate_bf(bf_model, req.sex, req.age, req.height_cm, start_mass, girths,
+                                      muscle_dial=dials["muscle"], measured_shape=req.from_photo)["bf_mid"]
+        # Fat only: lean mass, muscle and frame stay the person's own; abdominal
+        # tautness is set for the target.
         t = stage3.targets_for_bf(bf_model, req.sex, req.age, req.height_cm,
-                                  start_mass, girths, req.target_bf)
+                                  start_mass, girths, req.target_bf, start_bf)
         targets = {**t["girths_mm"], "mass_kg": t["mass_kg"]}
-        # Body fat also drives muscle: abdominal tautness is set for the target, the
-        # person's regional muscle sliders and muscle dial are nudged the same way.
-        muscle = muscle_dial_for_bf(req.sex, dials["muscle"], start_bf, t["target_bf"])
         new_dials, local, body, _, _ = solve(
             anny_body, req.sex, req.age, req.height_cm, targets,
             init_dials=dials, init_local=req.local, anchor_local=True,
-            fixed_local=fixed_for_bf(req.sex, t["target_bf"], req.local, start_bf),
-            muscle_prior=(muscle, 0.05),
+            fixed_local=fixed_for_bf(req.sex, t["target_bf"], req.local),
+            fixed_dials=FRAME_DIALS,
             steps=300)
-        texture = photo_view = None
+        photo_view = None
         session = photo_session if req.from_photo else None
-        if session is not None:   # re-draw the photo and its texture for the new body
+        if session is not None:   # re-draw the photo for the new body
             target_relief = relief(req.sex, t["target_bf"])
             with torch.no_grad():
                 posed = anny_body.build(req.sex, req.age, req.height_cm, new_dials, local, session["pose"])
             posed = (posed["posed_vertices"] + session["trans"]).numpy()
             photo_view = session["view"].render(posed, session["relief"], target_relief)
-            texture = appearance.restyle(session["texture"], session["skin_texels"],
-                                         session["relief"], target_relief)
-        reply = _payload(req, new_dials, local, body, started, bf=t["target_bf"], texture=texture)
+        reply = _payload(req, new_dials, local, body, started, bf=t["target_bf"])
         if photo_view is not None:
             reply["photo_view"] = _jpeg(photo_view, 93)
         reply["targets"] = {k: round(v, 1) for k, v in targets.items()}

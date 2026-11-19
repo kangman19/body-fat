@@ -1,4 +1,4 @@
-"""Stage 5: appearance. Muscle relief, clean photo texture, and the photoreal 2D view.
+"""Stage 5: appearance. Muscle relief on a clay body, and the photoreal 2D view.
 
 Nothing here is tuned to one photo: every position is taken from Anny's own joints and
 landmarks, and every colour from the uploaded image.
@@ -13,24 +13,17 @@ landmarks, and every colour from the uploaded image.
    Its strength is stage4_morph.relief(sex, body fat): 0 above 25% (men) / 32% (women),
    full at 8% / 18%. The colour map is never darkened to fake a groove.
 
-2. Photo texture (photo builds)
-   Every texel must pass a gate before it may take a pixel from the photo:
-     - it projects inside the person cut-out eroded by 4 px,
-     - at least 5 px from every image border (cropped feet, heads, hands),
-     - it is not on a hand (gloves, watches, rings and posed fingers never bake in),
-     - and, for the sharp photo, its skin faced the camera.
-   Texels that fail the last test but are behind the person get a heavily blurred copy
-   of the cut-out at the same spot (clothing keeps its colour on the back, no fake
-   detail). Everything else is grown in from neighbouring data over a short distance
-   and settles on the subject's own median skin tone, measured from texels that are
-   bare skin. Transitions are feathered.
+2. The 3D viewer draws every body, photo builds included, as plain matte clay: no
+   photo is painted onto the mesh. The photo only appears in the 2D view below.
 
 3. Photoreal 2D view (photo builds)
-   The morphed body is drawn from the photo's own camera into depth, normal and albedo
-   passes. The albedo pass is the real photo, moved pixel by pixel. New relief is lit
-   with lighting estimated from the photo itself (brightness against surface direction
-   on bare skin), the head is locked to the original pixels, and the result is laid
-   over a background with the person removed (LaMa).
+   The photo is split into layers by the fitted mesh: a background with the person
+   removed (LaMa), the body (trunk, legs, head), each arm, and the locked head. The body
+   follows the morphed mesh pixel by pixel; each arm moves whole, so a wider waist never
+   squashes it and a slimmer one never tears it. Changes of shape and of muscle relief
+   are lit with lighting estimated from the photo itself (brightness against surface
+   direction on bare skin). Depth, normal, silhouette, albedo and head lock passes come
+   from the same drawing (PhotoView.render(passes=True)).
 
 Static data (UV raster, subdivision) is cached in models/anny_uv_<size>_v2.npz.
 """
@@ -48,9 +41,7 @@ from stage2_measure import AnnyBody, default_dials
 
 ROOT = Path(__file__).resolve().parents[1]
 SIZE = 1024
-CLAY = (201, 164, 138)        # clay colour for bodies made from numbers
-ERODE_PX = 4                  # cut-out is shrunk by this much before any pixel is sampled
-BORDER_PX = 5                 # texels projecting this close to the image border are not sampled
+ERODE_PX = 4                  # cut-out is shrunk by this much before skin light is measured
 RELIEF_RANGE_M = 0.005        # height map stores -5 mm .. +5 mm
 NORMAL_SCALE_FULL = 0.45      # viewer normalScale at full relief (slopes are baked to match)
 PARTS = ["torso", "neck", "head", "upperarm", "lowerarm", "hand", "upperleg", "lowerleg", "foot"]
@@ -318,7 +309,7 @@ def normal_map(height_m: np.ndarray, position_map: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------- appearance
 
 class Appearance:
-    """Everything the viewer needs to draw a body's skin. One per server."""
+    """The muscle relief maps the viewer draws on the clay body. One per server."""
 
     def __init__(self, anny_body: AnnyBody, size: int = SIZE):
         self.layout = UVLayout(anny_body, size)
@@ -345,80 +336,6 @@ class Appearance:
         normals = lay.refine(np.asarray(mesh.vertex_normals)[lay.uv_to_vertex])
         normals /= np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12
         return lay.refine(vertices[lay.uv_to_vertex]) + normals * (self.fine_height_m * relief)[:, None], lay.fine_faces
-
-    def clay(self) -> np.ndarray:
-        """Plain clay colour. Relief is geometry and lighting, not colour."""
-        return np.full((self.layout.size, self.layout.size, 3), CLAY, dtype=np.uint8)
-
-    def bake_photo(self, image_rgb, mask, skin, pixel_xy, facing, fallback_tone=None):
-        """Front photo -> texture in Anny's UV layout.
-
-        pixel_xy (V, 2) and facing (V,) are per mesh vertex (PhotoView computes them).
-        skin is the bare-skin mask from stage 1 (or None).
-        Returns (texture uint8, skin_texels bool, skin_tone RGB).
-        """
-        lay = self.layout
-        h, w = mask.shape
-        core = cv2.erode(mask.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=ERODE_PX).astype(np.float32)
-        img = image_rgb.astype(np.float32)
-        sigma = max(h, w) * 0.02
-        weight = cv2.GaussianBlur(core, (0, 0), sigma)        # blurred cut-out: no background in the blur
-        soft = cv2.GaussianBlur(img * core[..., None], (0, 0), sigma) / np.maximum(weight, 1e-4)[..., None]
-
-        px = lay.spread(pixel_xy)
-        face = lay.spread(facing)[..., 0]
-        mx, my = px[..., 0].astype(np.float32), px[..., 1].astype(np.float32)
-        look = lambda a, mode=cv2.INTER_LINEAR: cv2.remap(a, mx, my, mode, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        # the gate
-        in_bounds = (mx >= BORDER_PX) & (mx <= w - 1 - BORDER_PX) & (my >= BORDER_PX) & (my <= h - 1 - BORDER_PX)
-        allowed = lay.covered & in_bounds & (lay.texel_part != PARTS.index("hand"))
-        sharp_ok = allowed & (look(core) > 0.99)
-        soft_ok = allowed & (look(weight) > 0.5)
-
-        sharp = cv2.remap(img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        blurred = cv2.remap(soft, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        w_sharp = np.clip((face - 0.25) / 0.35, 0, 1) * sharp_ok
-        w_soft = (1 - w_sharp) * soft_ok
-
-        # the subject's own skin tone, from texels that are sharp, front-facing bare skin
-        seen = sharp_ok & (face > 0.5)
-        is_skin = seen & (look(skin.astype(np.float32)) > 0.5) if skin is not None else np.zeros_like(seen)
-        if is_skin.sum() >= 300:
-            tone = np.median(sharp[is_skin], axis=0)
-        elif fallback_tone is not None:
-            tone = np.asarray(fallback_tone, dtype=np.float32)
-        elif seen.any():
-            tone = np.median(sharp[seen], axis=0)
-        else:
-            tone = np.array(CLAY, dtype=np.float32)
-
-        # Feather: a weight can only fall off towards a blocked area, never rise into it.
-        feather = lambda a, ok: cv2.GaussianBlur(a.astype(np.float32), (0, 0), 3.0) * ok
-        w_sharp, w_soft = feather(w_sharp, sharp_ok), feather(w_soft, soft_ok)
-        known = np.clip(w_sharp + w_soft, 0, 1)
-        data = (sharp * w_sharp[..., None] + blurred * w_soft[..., None]) / np.maximum(w_sharp + w_soft, 1e-4)[..., None]
-        # Texels with no photo data: grow colour in from neighbouring data over a short
-        # distance, settling on the skin tone further away. Short, so colour cannot
-        # creep across the gaps between UV islands onto another body part.
-        def grown(sigma, prior):
-            return (cv2.GaussianBlur(data * known[..., None], (0, 0), sigma) + prior * tone[None, None]) /                    (cv2.GaussianBlur(known, (0, 0), sigma) + prior)[..., None]
-        near = np.clip(cv2.GaussianBlur(known, (0, 0), 4.0) / 0.3, 0, 1)[..., None]
-        fill = grown(12.0, 0.05) * (1 - near) + grown(4.0, 0.02) * near
-        tex = data * known[..., None] + fill * (1 - known[..., None])
-        tex = lay.pad(np.where(lay.covered[..., None], tex, 0))
-        return np.clip(tex, 0, 255).astype(np.uint8), is_skin, tone
-
-    def restyle(self, base: np.ndarray, skin_texels: np.ndarray, start_relief: float, relief: float) -> np.ndarray:
-        """Photo texture for a morphed body. The colour map is never drawn on. Only when
-        the body is LESS defined than in the photo is bare skin smoothed where muscle
-        relief lives, so the photo's own definition fades with it."""
-        if relief >= start_relief:
-            return base
-        tex = base.astype(np.float32)
-        smooth = cv2.GaussianBlur(tex, (0, 0), self.layout.size * 0.012)
-        area = cv2.GaussianBlur((skin_texels & self.layout.covered).astype(np.float32), (0, 0), 2.0)
-        k = (min(1.0, (start_relief - relief) * 1.6) * self.relief_region * area)[..., None]
-        return np.clip(tex * (1 - k) + smooth * k, 0, 255).astype(np.uint8)
 
 
 # ------------------------------------------------------------ photoreal 2D view
@@ -468,35 +385,167 @@ def _rasterize(pixel_xy, depth, faces, size):
     return face_id, bary
 
 
+def _head_registration(vertices, landmark_groups, keypoints):
+    """Scale, rotation and shift (s, R, t) that carry the model's eyes, nose and ears
+    onto the same landmarks of the SAM body (both in the neutral pose): x -> s R x + t.
+    Ears count half: the two models mark them at slightly different points."""
+    weights = {"left_eye": 1.0, "right_eye": 1.0, "nose": 1.0, "left_ear": 0.5, "right_ear": 0.5}
+    names = [n for n in weights if n in keypoints]
+    if len(names) < 4:
+        return None
+    A = np.stack([vertices[landmark_groups[n]].mean(axis=0) for n in names])
+    B = np.stack([np.asarray(keypoints[n], dtype=np.float64) for n in names])
+    w = np.array([weights[n] for n in names]); w = w / w.sum()
+    ca, cb = (w[:, None] * A).sum(0), (w[:, None] * B).sum(0)
+    A0, B0 = A - ca, B - cb
+    U, D, Vt = np.linalg.svd((w[:, None] * B0).T @ A0)
+    sign = np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))])
+    R = U @ sign @ Vt
+    s = float((D * np.diag(sign)).sum() / (w * (A0 ** 2).sum(1)).sum())
+    s = min(max(s, 0.85), 1.25)        # a head is a head: never trust a wild scale
+    return s, R, cb - s * R @ ca
+
+
+def _fill_from(image, known, hole, scale):
+    """Colour for the `hole` pixels taken only from nearby `known` pixels: averages over
+    shrinking neighbourhoods, the finest one with enough known pixels winning. Smooth,
+    and never picks up colour from anything outside `known`."""
+    img = image.astype(np.float32)
+    k = known.astype(np.float32)
+    fill = np.zeros_like(img)
+    for i, sigma in enumerate((16 * scale, 8 * scale, 4 * scale, 2 * scale, scale)):
+        den = cv2.GaussianBlur(k, (0, 0), sigma)
+        est = cv2.GaussianBlur(img * k[..., None], (0, 0), sigma) / np.maximum(den, 1e-6)[..., None]
+        support = (den > 1e-4).astype(np.float32) if i == 0 else np.clip(den / 0.15, 0, 1)
+        fill = est * support[..., None] + fill * (1 - support[..., None])
+    out = img.copy()
+    out[hole] = fill[hole]
+    return out
+
+
+def _affine(src, dst):
+    """3x3 matrix A with A @ [x, y, 1] ~ the matching dst point (least squares)."""
+    A = np.linalg.lstsq(np.hstack([src, np.ones((len(src), 1))]), dst, rcond=None)[0].T
+    return np.vstack([A, [0.0, 0.0, 1.0]])
+
+
+def _rotation(pivot, angle):
+    """3x3 matrix turning image points by angle (radians) about pivot."""
+    c, s = np.cos(angle), np.sin(angle)
+    px, py = pivot
+    return np.array([[c, -s, px - c * px + s * py], [s, c, py - s * px - c * py], [0.0, 0.0, 1.0]])
+
+
 class PhotoView:
     """The original photo, re-drawn for a morphed body, from the photo's own camera.
 
     Nothing is generated: every pixel of the person is a pixel of the real photo, moved.
-    The morphed mesh is drawn in the camera view; each of its pixels knows which point
-    of the skin it shows and that point's place in the original photo. Pixels of the
-    person the mesh does not cover (hair, loose cloth, gloves) follow the nearest part
-    of the body, fading out with distance. The head never moves, so the face stays the
-    person's own. Where the body got smaller, the background plate shows through.
+    The person is split into layers by the fitted mesh, and each layer moves on its own:
+
+      background  the photo with the person removed (LaMa), made once.
+      body        trunk, legs and head. The morphed mesh (without its arms) is drawn in
+                  the camera view; each of its pixels knows which point of the skin it
+                  shows and that point's place in the photo. Pixels the mesh does not
+                  cover (hair, loose cloth) follow the nearest part of the body, fading
+                  with distance. Body the photo only saw behind an arm is filled in from
+                  the body around it, so it can show when the arm moves away.
+      arms        each arm is moved whole, by the straight-line (affine) map that best
+                  carries its mesh vertices to their new places: it shifts, turns and
+                  widens with the mesh but is never squashed by the trunk. When the
+                  trunk widens into an arm, the arm swings out from the shoulder.
+      head        the original pixels, never moved, so the face stays the person's own.
+
+    Drawn in that order with soft (about 2 px) edges. The body is shaded for its change
+    of shape with lighting estimated from the photo itself (fuller sides turn a little
+    darker, a slimmer waist shows its contour), and the muscle relief for the new body
+    fat is lit the same way.
     """
 
     def __init__(self, image_rgb, mask, skin, photo_pose, anny_body: AnnyBody,
-                 start_posed_vertices, appearance: Appearance):
+                 start_posed_vertices, appearance: Appearance, keypoints=None):
         self.image, self.mask, self.skin = image_rgb, mask, skin
         self.pp, self.app = photo_pose, appearance
         self.faces = anny_body.faces.numpy()
+        # Only the body is fitted, so the head can sit centimetres away from where SAM
+        # saw it. Line it up on eyes, nose and ears, or the face is drawn off its place.
+        self.head_share = anny_body.head_share[:, None]
+        self.head_fix = None
+        if keypoints is not None:
+            self.head_fix = _head_registration(start_posed_vertices, anny_body.face_landmarks, keypoints)
         self.face_is_head = (anny_body.vertex_part[self.faces] == "head").all(axis=1) | \
                             (anny_body.vertex_part[self.faces] == "neck").all(axis=1)
-        self.size = (image_rgb.shape[1], image_rgb.shape[0])
-        self.start_xy, self.facing, cam, normals, self.match = self._carry(start_posed_vertices, None)
+        # Region of every triangle: 0 trunk and head, 1/2 left/right arm, 3/4 left/right leg.
+        first = self.faces[:, 0]
+        limb = {"upperarm": 1, "lowerarm": 1, "hand": 1, "upperleg": 3, "lowerleg": 3, "foot": 3}
+        region = np.array([limb.get(p, 0) for p in anny_body.vertex_part[first]])
+        self.face_region = region + ((region > 0) & ~anny_body.vertex_left[first])
+        on_arm = np.isin(self.face_region, (1, 2))
+        self.body_faces, self.arm_faces = np.nonzero(~on_arm)[0], np.nonzero(on_arm)[0]
+        # Each arm's vertices, and the ring where it joins the trunk (its pivot).
+        self.arm_vertices, self.arm_seam = {}, {}
+        for k in (1, 2):
+            mine = np.unique(self.faces[self.face_region == k])
+            self.arm_vertices[k] = mine
+            self.arm_seam[k] = np.intersect1d(mine, np.unique(self.faces[self.face_region != k]))
+        w, h = self.size = (image_rgb.shape[1], image_rgb.shape[0])
+        self.start_xy, self.facing, cam, self.start_normals, self.match = self._carry(start_posed_vertices, None)
         face_id, bary = _rasterize(self.start_xy, cam[:, 2], self.faces, self.size)
+        # Which region every pixel of the photo belongs to: that of the nearest body pixel.
+        _, near = self._nearest(face_id >= 0)
+        owner = self.face_region[np.maximum(face_id, 0)][near]
         self.start_head = self._head(face_id)
-        self.light = self._estimate_light(face_id, bary, normals)
+        self.light = self._estimate_light(face_id, bary, self.start_normals)
         self.plate = background_plate(image_rgb, mask)
+
+        # ---- the layers, in the photo
+        person = mask.astype(bool)
+        arm_px = person & np.isin(owner, (1, 2))
+        body_fid, _ = self._raster(self.start_xy, cam, self.body_faces)
+        # Body the photo saw only behind an arm: arm pixels with trunk or leg mesh under
+        # them, arm pixels with body on both sides in the same row (a forearm hanging in
+        # front of the hip), and a strip of arm along every edge it shares with the body,
+        # so the arm's soft edge always lies over body, never over the background.
+        body_px = person & ~arm_px
+        strip = max(6, int(round(0.025 * max(w, h))))
+        along = cv2.dilate(body_px.astype(np.uint8), cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * strip + 1, 2 * strip + 1))) > 0
+        span = max(9, int(round(0.08 * max(w, h))))
+        row = np.ones((1, span), np.uint8)
+        body_right = cv2.dilate(body_px.astype(np.uint8), row, anchor=(0, 0)) > 0         # body within span to the right
+        body_left = cv2.dilate(body_px.astype(np.uint8), row, anchor=(span - 1, 0)) > 0   # and to the left
+        mesh_under = cv2.dilate(((body_fid >= 0) & arm_px).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        crossing = arm_px & body_left & body_right
+        behind = arm_px & (mesh_under | along | crossing)
+        # Filled-in body only counts near the new body mesh, or it would show as a ghost
+        # of the old outline where an arm moves away.
+        self.fill_needs_mesh = behind.astype(np.float32)
+        dist_body, nearest_body = self._nearest(body_px)
+        self.body_label = owner.copy()                      # region each body-layer pixel belongs to
+        self.body_label[behind] = np.where(body_fid >= 0, self.face_region[np.maximum(body_fid, 0)],
+                                           owner[nearest_body])[behind]
+        self.body_alpha = (body_px | behind).astype(np.float32)
+        # Fill colour comes from inside the body only (outline pixels are mixed with the
+        # background), and the fill starts from the real pixels at the arm's edge.
+        inside = cv2.erode(person.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=4) > 0
+        known = (cv2.erode(body_px.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0) & inside
+        filled = _fill_from(image_rgb, known, behind, scale=max(1.0, 0.004 * max(w, h)))
+        ramp = np.clip((dist_body - 1.0) / 4.0, 0, 1)[..., None] * behind[..., None]
+        self.body_image = image_rgb.astype(np.float32) * (1 - ramp) + filled * ramp
+        self.arm_alpha = {k: (person & (owner == k)).astype(np.float32) for k in (1, 2)}
+        # How far, row by row, the trunk and leg mesh reaches behind each arm in the photo.
+        arm_fid, _ = self._raster(self.start_xy, cam, self.arm_faces)
+        self.overlap = {k: ((body_fid >= 0) & (self.face_region[np.maximum(arm_fid, 0)] == k) & (arm_fid >= 0))
+                        .sum(axis=1).astype(np.float32) for k in (1, 2)}
+        # Where the head is fully locked, its original pixels are drawn last, over everything.
+        self.head_alpha = np.clip((self.start_head * 1.5 - 0.8) / 0.2, 0, 1) * person
 
     def _carry(self, anny_vertices, match):
         """Anny vertices (fit pose) -> photo pixels, how much each faces the camera,
         camera-space points and normals. The first pairing with the SAM body is reused,
         so the same skin point is followed from the fitted body to a morphed one."""
+        if self.head_fix is not None:
+            s, R, t = self.head_fix
+            anny_vertices = anny_vertices + self.head_share * (s * anny_vertices @ R.T + t - anny_vertices)
         normals = np.asarray(trimesh.Trimesh(anny_vertices, self.faces, process=False).vertex_normals)
         N = self.pp.N.numpy()
         if match is None:
@@ -512,15 +561,35 @@ class PhotoView:
         toward = -(cam_normals * (cam / np.linalg.norm(cam, axis=1, keepdims=True))).sum(1)
         return xy.astype(np.float32), np.clip(toward, 0, 1).astype(np.float32), cam, cam_normals, match
 
+    def _raster(self, xy, cam, subset):
+        """_rasterize over some of the triangles; ids are of the whole mesh."""
+        fid, bary = _rasterize(xy, cam[:, 2], self.faces[subset], self.size)
+        return np.where(fid >= 0, subset[np.maximum(fid, 0)], -1), bary
+
+    def _interp(self, per_vertex, fid, bary):
+        return (per_vertex[self.faces[np.maximum(fid, 0)]] * bary[..., None]).sum(axis=2)
+
+    @staticmethod
+    def _nearest(covered):
+        """For every pixel: distance to the nearest covered pixel, and that pixel's (row, column)."""
+        dist, labels = cv2.distanceTransformWithLabels((~covered).astype(np.uint8), cv2.DIST_L2, 5,
+                                                       labelType=cv2.DIST_LABEL_PIXEL)
+        ys, xs = np.nonzero(covered)
+        lookup = np.zeros(labels.max() + 1, dtype=np.int64)
+        lookup[labels[ys, xs]] = np.arange(len(ys))
+        return dist, (ys[lookup[labels]], xs[lookup[labels]])
+
     def _head(self, face_id):
         head = (face_id >= 0) & self.face_is_head[np.maximum(face_id, 0)]
-        return cv2.GaussianBlur(head.astype(np.float32), (0, 0), max(2.0, 0.012 * max(self.size)))
+        # Wide fall-off: where the trapezius moves and the neck does not, the outline
+        # bends gently instead of stepping.
+        return cv2.GaussianBlur(head.astype(np.float32), (0, 0), max(2.0, 0.025 * max(self.size)))
 
     def _estimate_light(self, face_id, bary, normals):
         """Lighting of the photo as brightness = c0 + c . normal, fitted on bare skin.
         Falls back to soft light from above and in front when there is too little skin."""
         covered = face_id >= 0
-        n = (normals[self.faces[np.maximum(face_id, 0)]] * bary[..., None]).sum(axis=2)
+        n = self._interp(normals, face_id, bary)
         core = cv2.erode(self.mask.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=ERODE_PX) > 0
         use = covered & core & (self.skin if self.skin is not None else core)
         fallback = np.array([0.6, 0.0, -0.25, -0.35], dtype=np.float32)
@@ -532,69 +601,183 @@ class PhotoView:
         coef = np.linalg.lstsq(A, lum, rcond=None)[0].astype(np.float32)
         return coef if np.isfinite(coef).all() and coef[0] > 0.1 else fallback
 
-    def render(self, posed_vertices, start_relief: float, relief: float, passes: bool = False):
-        """posed_vertices: the morphed Anny body in the fit pose (same frame as the
-        vertices given at construction). Returns the re-drawn photo (RGB), or with
-        passes=True a dict that also holds the depth, normal and albedo passes."""
-        w, h = self.size
-        xy, _, cam, normals, _ = self._carry(posed_vertices, self.match)
-        face_id, bary = _rasterize(xy, cam[:, 2], self.faces, self.size)
-        covered = face_id >= 0
-        corners = self.faces[np.maximum(face_id, 0)]
-        interp = lambda per_vertex: (per_vertex[corners] * bary[..., None]).sum(axis=2)
-        source = interp(self.start_xy)                                        # where each pixel comes from
-        gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-        move = np.where(covered[..., None], source - np.stack([gx, gy], axis=-1), 0).astype(np.float32)
-        # Carry the movement outwards to nearby pixels, fading with distance.
-        dist, labels = cv2.distanceTransformWithLabels((~covered).astype(np.uint8), cv2.DIST_L2, 5,
-                                                       labelType=cv2.DIST_LABEL_PIXEL)
-        ys, xs = np.nonzero(covered)
-        lookup = np.zeros(labels.max() + 1, dtype=np.int64)
-        lookup[labels[ys, xs]] = np.arange(len(ys))
-        near = (ys[lookup[labels]], xs[lookup[labels]])
-        fade = np.exp(-dist / (0.04 * max(w, h)))[..., None]
-        move = np.where(covered[..., None], move, move[near] * fade)
-        # Identity lock: the head keeps its original pixels.
-        lock = np.clip(np.maximum(self.start_head, self._head(face_id)) * 1.5, 0, 1)[..., None]
-        move = cv2.GaussianBlur(move * (1 - lock), (0, 0), 1.5)
-        mx, my = gx + move[..., 0], gy + move[..., 1]
-        albedo = cv2.remap(self.image.astype(np.float32), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        alpha = cv2.remap(self.mask.astype(np.float32), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        alpha = cv2.GaussianBlur(alpha, (0, 0), 1.0)[..., None]
-        skin = np.ones((h, w), np.float32) if self.skin is None else \
-            cv2.remap(self.skin.astype(np.float32), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        skin = cv2.GaussianBlur(skin * covered * (1 - lock[..., 0]), (0, 0), 1.5)
+    def _brightness(self, n):
+        return (self.light[0] + n @ self.light[1:]).clip(0.05)
 
-        # Relief change, drawn in the same view from the UV maps.
+    def _relief(self, layer, skin, fid, bary, normals, cam, start_relief, relief):
+        """A layer re-lit for the new muscle relief, from the UV maps at its pixels.
+        More defined than the photo: the extra relief is lit with the photo's own light.
+        Less defined: the photo's own definition fades."""
+        change = relief - start_relief
+        covered = fid >= 0
+        if abs(change) <= 1e-3 or not covered.any():
+            return layer
+        w, h = self.size
         layout = self.app.layout
         n_tex = layout.size
-        uv = (layout.uv[layout.uv_faces[np.maximum(face_id, 0)]] * bary[..., None]).sum(axis=2)
+        uv = (layout.uv[layout.uv_faces[np.maximum(fid, 0)]] * bary[..., None]).sum(axis=2)
         tu = (uv[..., 0] * (n_tex - 1)).astype(np.float32)
         tv = ((1 - uv[..., 1]) * (n_tex - 1)).astype(np.float32)
-        normal = interp(normals)
-        normal /= np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-9
-        person, change = albedo, relief - start_relief
-        if change > 1e-3:
-            # More defined than the photo: light the extra relief with the photo's own light.
+        if change > 0:
+            normal = self._interp(normals, fid, bary)
+            normal /= np.linalg.norm(normal, axis=-1, keepdims=True) + 1e-9
             metres_per_px = float(np.median(cam[:, 2])) / self.pp.view["focal"]
             height = cv2.GaussianBlur(cv2.remap(self.app.height_m, tu, tv, cv2.INTER_LINEAR) * covered, (0, 0), 1.0)
             slope_y, slope_x = np.gradient(height * change / metres_per_px)
             bumped = normal - np.stack([slope_x, slope_y, np.zeros_like(slope_x)], axis=-1)
             bumped /= np.linalg.norm(bumped, axis=-1, keepdims=True) + 1e-9
-            c0, c = self.light[0], self.light[1:]
-            ratio = np.clip((c0 + bumped @ c).clip(0.05) / (c0 + normal @ c).clip(0.05), 0.72, 1.28)
-            ratio = 1 + (cv2.GaussianBlur(ratio.astype(np.float32), (0, 0), 0.7) - 1) * skin
-            person = albedo * ratio[..., None]
-            normal = bumped
-        elif change < -1e-3:
-            # Less defined than the photo: let the photo's own definition fade.
-            region = cv2.remap(self.app.relief_region, tu, tv, cv2.INTER_LINEAR) * skin
-            k = cv2.GaussianBlur((min(1.0, -change * 1.6) * region).astype(np.float32), (0, 0), 2.0)[..., None]
-            person = albedo * (1 - k) + cv2.GaussianBlur(albedo, (0, 0), 0.012 * max(w, h)) * k
-        out = np.clip(self.plate.astype(np.float32) * (1 - alpha) + person * alpha, 0, 255).astype(np.uint8)
+            ratio = np.clip(self._brightness(bumped) / self._brightness(normal), 0.72, 1.28)
+            ratio = 1 + (cv2.GaussianBlur(ratio.astype(np.float32), (0, 0), 0.7) - 1) * skin * covered
+            return layer * ratio[..., None]
+        region = cv2.remap(self.app.relief_region, tu, tv, cv2.INTER_LINEAR) * skin * covered
+        k = cv2.GaussianBlur((min(1.0, -change * 1.6) * region).astype(np.float32), (0, 0), 2.0)[..., None]
+        return layer * (1 - k) + cv2.GaussianBlur(layer, (0, 0), 0.012 * max(w, h)) * k
+
+    def render(self, posed_vertices, start_relief: float, relief: float, passes: bool = False):
+        """posed_vertices: the morphed Anny body in the fit pose (same frame as the
+        vertices given at construction). Returns the re-drawn photo (RGB), or with
+        passes=True a dict that also holds the depth, normal, silhouette, albedo and
+        head lock passes."""
+        w, h = self.size
+        xy, _, cam, normals, _ = self._carry(posed_vertices, self.match)
+        gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+        photo = self.image.astype(np.float32)
+        skin_src = np.ones((h, w), np.float32) if self.skin is None else self.skin.astype(np.float32)
+        feather = lambda a: cv2.GaussianBlur(a.astype(np.float32), (0, 0), 1.0)
+
+        # ---- body layer: the mesh without its arms tells every pixel where it comes from
+        fid_b, bary_b = self._raster(xy, cam, self.body_faces)
+        covered = fid_b >= 0
+        source = self._interp(self.start_xy, fid_b, bary_b)
+        move = np.where(covered[..., None], source - np.stack([gx, gy], axis=-1), 0).astype(np.float32)
+        dist, near = self._nearest(covered)
+        fade = np.exp(-dist / (0.04 * max(w, h)))[..., None]
+        # Each pixel beyond the mesh copies its nearest mesh pixel; smoothed, so the
+        # outline (top of the shoulders, hair) stays smooth instead of ragged.
+        smooth = lambda f: cv2.GaussianBlur(f.astype(np.float32), (0, 0), 0.012 * max(w, h))
+        move = np.where(covered[..., None], move, smooth(move[near] * fade))
+        # A leg only carries pixels that were its own (or the trunk's): in the gap between
+        # the legs one leg's movement must not reach across and drag the other.
+        giver = self.face_region[np.maximum(fid_b, 0)][near]
+        sx = np.clip(np.rint(gx + move[..., 0]), 0, w - 1).astype(np.int32)
+        sy = np.clip(np.rint(gy + move[..., 1]), 0, h - 1).astype(np.int32)
+        label = self.body_label[sy, sx]
+        own = covered | (label == giver) | (label == 0) | (giver == 0)
+        move = move * own[..., None]
+        # Identity lock: the head keeps its original pixels.
+        lock = np.clip(np.maximum(self.start_head, self._head(fid_b)) * 1.5, 0, 1)
+        move = cv2.GaussianBlur(move * (1 - lock[..., None]), (0, 0), 1.5)
+        mx, my = gx + move[..., 0], gy + move[..., 1]
+        # Edges of the photo continue past the frame (a cropped body goes on below it).
+        look = lambda a: cv2.remap(a, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        body_albedo = look(self.body_image)
+        # (the fitted mesh sits a little inside the real outline, so allow a margin)
+        stray = (look(self.fill_needs_mesh) > 0.5) & (dist > 0.02 * max(w, h))
+        body_alpha = feather(look(self.body_alpha) * own * ~stray)
+        body_skin = look(skin_src) * covered * (1 - lock)
+        # Shading for the change of shape: brightness of the new surface direction over
+        # that of the same skin point in the photo, with the photo's own light.
+        n_new = self._interp(normals, fid_b, bary_b)
+        n_new /= np.linalg.norm(n_new, axis=-1, keepdims=True) + 1e-9
+        n_old = self._interp(self.start_normals, fid_b, bary_b)
+        n_old /= np.linalg.norm(n_old, axis=-1, keepdims=True) + 1e-9
+        shade = np.clip(self._brightness(n_new) / self._brightness(n_old), 0.82, 1.2)
+        facing = np.clip((-n_new[..., 2] - 0.15) / 0.3, 0, 1)     # fades out towards the outline
+        shade = 1 + (cv2.GaussianBlur(shade.astype(np.float32), (0, 0), 0.004 * max(w, h)) - 1) \
+            * facing * covered * (1 - lock)
+        body = self._relief(body_albedo * shade[..., None], body_skin, fid_b, bary_b, normals, cam,
+                            start_relief, relief)
+
+        # ---- arm layers: each moved whole
+        fid_a, bary_a = self._raster(xy, cam, self.arm_faces)
+        out = self.plate.astype(np.float32) * (1 - body_alpha[..., None]) + body * body_alpha[..., None]
+        albedo = body_albedo * body_alpha[..., None]
+        person_alpha = body_alpha.copy()
+        clear = 1 - body_alpha                     # how much background still shows, layer by layer
+        arms_solid = np.zeros((h, w), bool)
+        rows = np.arange(h, dtype=np.float32)
+        for k in (1, 2):
+            idx = self.arm_vertices[k]
+            if self.arm_alpha[k].sum() < 50:
+                continue
+            M = _affine(xy[idx], self.start_xy[idx])          # new place -> place in the photo
+            # Does the trunk mesh now reach further behind the arm than in the photo (the
+            # meshes pass through each other)? Then the arm swings out from the shoulder by
+            # about that much. Only rows well below the armpit count: near the pivot a pixel
+            # of wobble would read as a large angle.
+            pivot = xy[self.arm_seam[k]].mean(axis=0)
+            arm_mesh = (fid_a >= 0) & (self.face_region[np.maximum(fid_a, 0)] == k)
+            extra = ((fid_b >= 0) & arm_mesh).sum(axis=1) - self.overlap[k]
+            extra = np.convolve(extra.astype(np.float32), np.ones(5) / 5, mode="same")
+            reach = rows - pivot[1]
+            arm_rows = np.nonzero(arm_mesh.any(axis=1))[0]
+            length = float(arm_rows.max() - pivot[1]) if len(arm_rows) else 0.0
+            test = (reach > 0.35 * length) & arm_mesh.any(axis=1) & (extra > 2.0)
+            grid = np.stack([gx, gy, np.ones_like(gx)], axis=-1)
+            src = grid @ M[:2].T
+            if length > 0 and test.sum() >= 3:
+                angle = min(float(np.percentile(extra[test] / reach[test], 90)), np.radians(10))
+                if angle > 1e-3:
+                    side = 1.0 if xy[idx, 0].mean() > xy[:, 0].mean() else -1.0
+                    # Turning by -side*angle moves the hanging arm away from the body. It
+                    # fades in below the shoulder, so the top of the arm does not tip into
+                    # the trapezius.
+                    turned = grid @ (M @ np.linalg.inv(_rotation(pivot, -side * angle)))[:2].T
+                    t = np.clip((gy - pivot[1]) / (0.3 * length), 0, 1)[..., None]
+                    src = src * (1 - t) + turned * t
+            # Where the arm joins the trunk it follows the mesh pixel by pixel, like the
+            # trunk beside it, so the two meet without a crack; further down it moves whole.
+            mine = (fid_a >= 0) & (self.face_region[np.maximum(fid_a, 0)] == k)
+            if mine.any():
+                flow = np.where(mine[..., None], self._interp(self.start_xy, fid_a, bary_a), 0)
+                _, near_a = self._nearest(mine)
+                grid2 = np.stack([gx, gy], -1)
+                flow = np.where(mine[..., None], flow, smooth(flow[near_a] - grid2[near_a]) + grid2)
+                seam = np.zeros((h, w), np.uint8)
+                for x_, y_ in np.round(xy[self.arm_seam[k]]).astype(int):
+                    if 0 <= x_ < w and 0 <= y_ < h:
+                        seam[y_, x_] = 1
+                d_seam = cv2.distanceTransform(1 - seam, cv2.DIST_L2, 5)
+                near_seam = np.exp(-(d_seam / (0.04 * max(w, h))) ** 2)[..., None]
+                src = src * (1 - near_seam) + flow * near_seam
+            sx_a, sy_a = src[..., 0].astype(np.float32), src[..., 1].astype(np.float32)
+            warp = lambda a: cv2.remap(a, sx_a, sy_a, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            arm_albedo = warp(photo)
+            arm_alpha = feather(warp(self.arm_alpha[k]))
+            arm_skin = warp(skin_src) * (fid_a >= 0)
+            arm = self._relief(arm_albedo, arm_skin, fid_a, bary_a, normals, cam, start_relief, relief)
+            out = out * (1 - arm_alpha[..., None]) + arm * arm_alpha[..., None]
+            albedo = albedo * (1 - arm_alpha[..., None]) + arm_albedo * arm_alpha[..., None]
+            person_alpha = np.maximum(person_alpha, arm_alpha)
+            clear = clear * (1 - arm_alpha)
+            arms_solid |= arm_alpha > 0.5
+
+        # ---- head: the original pixels, last
+        head = feather(self.head_alpha)[..., None]
+        out = out * (1 - head) + photo * head
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        # Slits: where layers that met in the photo (an arm lying against the trunk) drift
+        # a little apart, close the slit from the person around it. Only where the photo
+        # showed the person: background the photo already showed stays background, and
+        # wider gaps stay open.
+        clear = clear * (1 - head[..., 0])
+        reach = max(3, int(round(0.01 * max(w, h))))
+        grow = lambda a: cv2.dilate(a.astype(np.uint8), cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * reach + 1, 2 * reach + 1))) > 0
+        crack = (clear > 0.05) & grow(body_alpha > 0.5) & grow(arms_solid) & self.mask.astype(bool)
+        if crack.any():
+            out = cv2.inpaint(out, crack.astype(np.uint8), 3, cv2.INPAINT_TELEA)
+            person_alpha = np.maximum(person_alpha, crack.astype(np.float32))
         if not passes:
             return out
-        depth = np.where(covered, interp(cam[:, 2:3])[..., 0], np.inf).astype(np.float32)
-        return {"image": out, "depth": depth, "covered": covered,
-                "normal": np.where(covered[..., None], normal, 0).astype(np.float32),
-                "albedo": np.clip(albedo, 0, 255).astype(np.uint8), "alpha": alpha[..., 0]}
+        # Depth and normals of whichever mesh part is in front at each pixel.
+        depth_b = np.where(covered, self._interp(cam[:, 2:3], fid_b, bary_b)[..., 0], np.inf)
+        depth_a = np.where(fid_a >= 0, self._interp(cam[:, 2:3], fid_a, bary_a)[..., 0], np.inf)
+        front_arm = depth_a < depth_b
+        n_arm = self._interp(normals, fid_a, bary_a)
+        n_arm /= np.linalg.norm(n_arm, axis=-1, keepdims=True) + 1e-9
+        normal = np.where(front_arm[..., None], n_arm, np.where(covered[..., None], n_new, 0))
+        return {"image": out, "depth": np.minimum(depth_a, depth_b).astype(np.float32),
+                "covered": covered | (fid_a >= 0), "normal": normal.astype(np.float32),
+                "albedo": np.clip(albedo, 0, 255).astype(np.uint8), "alpha": person_alpha,
+                "head_lock": np.maximum(lock, feather(self.head_alpha)).astype(np.float32)}

@@ -10,12 +10,13 @@ What Adam is allowed to move:
            zero (or towards their starting values) so the whole-body dials do most of
            the work
 
-What is set, not solved (fixed_for_bf):
+What is set, not solved, in a body fat morph (fixed_for_bf, FRAME_DIALS):
     definition  DEFINITION_LOCALS: abdominal tautness, straight from body fat.
-    muscle      MUSCLE_LOCALS: the person's own regional muscle, shifted slightly with
-                body fat. Kept out of the solver so a girth target is met by changing
-                fat, not by inventing or removing muscle.
-    The solver works around both, so the girth targets are still met with them applied.
+    muscle      MUSCLE_LOCALS and the muscle dial: the person's own muscle, unchanged.
+                Losing or gaining fat never grows or melts muscle.
+    frame       the proportions and height dials and the shoulder width slider: bone,
+                which body fat does not change.
+    The solver works around them, so the girth targets are still met with them applied.
 
 The finer muscle contours (abdominal blocks, serratus, deltoid and quadriceps
 separations) are too small for Anny's mesh; they are surface relief, see stage 5.
@@ -24,7 +25,6 @@ Targets may also include "mass_kg" (weight from mesh volume).
 
 Loss = mean squared relative target error
      + local_weight * mean((local - anchor)^2)
-     + muscle prior (optional), keeping the muscle dial near a wanted value
      + a term keeping Anny's natural height close to height_cm (so rescaling stays ~1).
 """
 from __future__ import annotations
@@ -36,15 +36,15 @@ import numpy as np
 import torch
 import trimesh
 
-from stage2_measure import (DEFINITION_LOCALS, DIAL_RANGES, LOCAL_LABELS, MUSCLE_LOCALS,
-                            AnnyBody, default_dials)
+from stage2_measure import (DEFINITION_LOCALS, DIAL_RANGES, EXTRA_GIRTH_KEYS, LOCAL_LABELS,
+                            MUSCLE_LOCALS, AnnyBody, default_dials)
 
 # Body fat (DXA %) at or below which definition is full, and at or above which the
 # surface is completely smooth.
 DEFINITION_BF = {"male": (8.0, 25.0), "female": (18.0, 32.0)}
 DEFINITION_STRENGTH = {"male": 1.0, "female": 0.6}   # women carry less visible relief at the same leanness
-MUSCLE_DIAL_SWING = 0.30      # change in Anny's muscle dial from smooth to full definition
-MUSCLE_SLIDER_SWING = 0.5     # same for the regional muscle sliders
+FRAME_DIALS = ["muscle", "proportions", "height"]     # held at the person's values in a body fat morph
+FRAME_LOCALS = ["measure-shoulder-dist-incr"]          # same, among the shape sliders
 # Waist is the measurement body fat depends on most, so missing it costs more.
 TARGET_WEIGHT = {"waist": 4.0, "waist_iliac": 4.0, "waist_navel": 4.0}
 
@@ -60,22 +60,14 @@ def relief(sex: str, bf: float) -> float:
     return DEFINITION_STRENGTH[sex] * definition(sex, bf)
 
 
-def fixed_for_bf(sex: str, target_bf: float, start_local: dict | None = None,
-                 start_bf: float | None = None) -> dict[str, float]:
-    """Sliders that are set, not solved, for a body at target_bf. start_local/start_bf
-    describe the body being morphed (leave empty when there is none)."""
+def fixed_for_bf(sex: str, target_bf: float, start_local: dict | None = None) -> dict[str, float]:
+    """Sliders that are set, not solved, for a body at target_bf: abdominal tautness from
+    body fat, and the person's own muscle and shoulder width as they are. start_local
+    describes the body being morphed (leave empty when there is none)."""
     start_local = start_local or {}
-    shift = MUSCLE_SLIDER_SWING * (relief(sex, target_bf) - relief(sex, target_bf if start_bf is None else start_bf))
     fixed = {k: relief(sex, target_bf) for k in DEFINITION_LOCALS}
-    fixed.update({k: float(min(max(start_local.get(k, 0.0) + shift, -1.5), 1.5)) for k in MUSCLE_LOCALS})
+    fixed.update({k: float(start_local.get(k, 0.0)) for k in MUSCLE_LOCALS + FRAME_LOCALS})
     return fixed
-
-
-def muscle_dial_for_bf(sex: str, start_muscle: float, start_bf: float, target_bf: float) -> float:
-    """Muscle dial to aim for at target_bf, relative to the person's own starting dial."""
-    lo, hi = DIAL_RANGES["muscle"]
-    shift = MUSCLE_DIAL_SWING * (relief(sex, target_bf) - relief(sex, start_bf))
-    return float(min(max(start_muscle + shift, lo), hi))
 
 
 def _to_raw(value, lo, hi):
@@ -92,7 +84,7 @@ def solve(
     init_dials: dict[str, float] | None = None,
     init_local: dict[str, float] | None = None,
     fixed_local: dict[str, float] | None = None,
-    muscle_prior: tuple[float, float] | None = None,
+    fixed_dials: list[str] | tuple = (),
     anchor_local: bool = False,
     steps: int = 200,
     lr: float = 0.05,
@@ -104,7 +96,7 @@ def solve(
 
     targets       girths in mm by name, optionally "mass_kg".
     fixed_local   sliders applied but not optimised (see fixed_for_bf).
-    muscle_prior  (value, weight): keep the muscle dial near value.
+    fixed_dials   dials kept at their init_dials values (see FRAME_DIALS).
     anchor_local  pull local sliders towards init_local instead of towards zero. Use it
                   when morphing a fitted person, so their own build is kept.
 
@@ -116,7 +108,7 @@ def solve(
     init_local = {k: float(np.clip((init_local or {}).get(k, 0.0), -0.999, 0.999)) for k in LOCAL_LABELS}
     fixed_local = dict(fixed_local or {})
     raw_d = {
-        k: torch.tensor(_to_raw(init_dials[k], *DIAL_RANGES[k]), requires_grad=True)
+        k: torch.tensor(_to_raw(init_dials[k], *DIAL_RANGES[k]), requires_grad=k not in fixed_dials)
         for k in DIAL_RANGES
     }
     raw_l = {k: torch.tensor(float(np.arctanh(init_local[k])), requires_grad=True) for k in LOCAL_LABELS}
@@ -128,22 +120,21 @@ def solve(
         local = {k: torch.tanh(r) for k, r in raw_l.items()}
         return dials, local
 
-    opt = torch.optim.Adam(list(raw_d.values()) + list(raw_l.values()), lr=lr)
+    opt = torch.optim.Adam([r for r in raw_d.values() if r.requires_grad] + list(raw_l.values()), lr=lr)
     history, landmarks = [], None
+    full = any(k in EXTRA_GIRTH_KEYS for k in targets)   # a target among the extra tapes
     for step in range(steps):
         opt.zero_grad()
         dials, local = current()
         body = anny_body.build(sex, age, height_cm, dials, {**local, **fixed_local})
         if step % relocate_every == 0:  # tape positions move slowly; refresh now and then
-            landmarks = anny_body.landmarks(body)
-        measured = anny_body.measure(body, landmarks)
+            landmarks = anny_body.landmarks(body, full=full)
+        measured = anny_body.measure(body, landmarks, full=full)
         measured["mass_kg"] = body["mass_kg"]
         loss = torch.stack([TARGET_WEIGHT.get(k, 1.0) * ((measured[k] - t) / t) ** 2
                             for k, t in targets.items()]).mean()
         loss = loss + local_weight * torch.stack([(local[k] - anchor[k]) ** 2 for k in LOCAL_LABELS]).mean()
         loss = loss + 10.0 * (body["natural_height_m"] - height_cm / 100.0) ** 2
-        if muscle_prior is not None:
-            loss = loss + muscle_prior[1] * (dials["muscle"] - muscle_prior[0]) ** 2
         loss.backward()
         opt.step()
         worst = max(abs(float(measured[k].detach()) - t) for k, t in targets.items() if k != "mass_kg")

@@ -94,9 +94,12 @@ class SamBody:
             shapes.append(np.asarray(people[0]["shape_params"], dtype=np.float32))
             scales.append(np.asarray(people[0]["scale_params"], dtype=np.float32))
             if view is None:
+                points = np.asarray(people[0]["pred_keypoints_2d"], dtype=np.float64)
                 view = {"vertices": np.asarray(people[0]["pred_vertices"], dtype=np.float64),
                         "cam_t": np.asarray(people[0]["pred_cam_t"], dtype=np.float64),
-                        "focal": float(people[0]["focal_length"]), "size": (w, h)}
+                        "focal": float(people[0]["focal_length"]), "size": (w, h),
+                        # where SAM puts each joint in the photo (may be outside it)
+                        "keypoints_2d": {self.keypoint_names[i]: points[i] for i in range(70)}}
         return np.mean(shapes, axis=0), np.mean(scales, axis=0), view
 
     def neutral_body(self, shape, scale, height_cm):
@@ -217,10 +220,28 @@ def measure_generic(vertices, faces, kp, sex) -> dict:
 
 def decode_image(data: bytes) -> np.ndarray:
     """Image file bytes -> RGB array (phone rotation tags are applied by OpenCV)."""
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError("That file is not an image this app can read.")
+    if img.dtype != np.uint8:
+        img = (img.astype(np.float32) / np.iinfo(img.dtype).max * 255).astype(np.uint8)
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    if img.shape[2] == 4:  # see-through background: put the person on white, not on black
+        a = img[..., 3:4].astype(np.float32) / 255.0
+        img = (img[..., :3] * a + 255.0 * (1 - a)).astype(np.uint8)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def decode_cutout(data: bytes):
+    """If the image file has a see-through background, that is an exact cut-out of the
+    person: returns it as a bool mask. Otherwise None."""
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
+    if img is None or img.ndim != 3 or img.shape[2] != 4:
+        return None
+    a = img[..., 3].astype(np.float32) / np.iinfo(img.dtype).max
+    clear = float((a < 0.5).mean())
+    return a > 0.5 if 0.02 < clear < 0.98 else None
 
 
 def person_mask(image_rgb) -> np.ndarray:
@@ -348,9 +369,13 @@ class SilhouetteLoss:
     """
 
     GRID = 256
+    # Rows whose outermost point is upper arm or deltoid count this much in the width
+    # term. They are the widest part of the body and the hardest for the sliders to reach.
+    UPPER_ARM_WIDTH_WEIGHT = 2.0
 
     def __init__(self, photo_pose: "PhotoPose", mask, skin, anny_body: AnnyBody):
         self.pp = pp = photo_pose
+        self.upper_arm = anny_body.upperarm_share > 0.2     # arm, deltoid and armpit
         h, w = mask.shape
         self.size = (w, h)
         self.faces = anny_body.faces
@@ -405,6 +430,27 @@ class SilhouetteLoss:
         self.blur = (k[:, None] * k[None, :])[None, None]
         self.mask_np = mask
 
+    def sam_side_share(self) -> np.ndarray:
+        """Per SAM vertex, 0..1: how much its place is measured directly by this photo.
+        High where SAM's skin is edge-on to the camera (it forms the outline) AND the
+        photo's outline nearby is bare skin. SAM's own guess there should give way to
+        the photo: on a lean or muscular person it tends to come out narrower."""
+        pp = self.pp
+        P = pp.P.numpy()
+        n = np.asarray(trimesh.Trimesh(pp.view["vertices"], pp.faces, process=False).vertex_normals)
+        graze = 1 - np.abs((n * P / np.linalg.norm(P, axis=1, keepdims=True)).sum(1))
+        w, h = self.size
+        outline = np.full((h, w), 255, np.uint8)
+        o = self.outline.numpy().astype(int)
+        outline[o[:, 1], o[:, 0]] = 0
+        to_outline = cv2.distanceTransform(outline, cv2.DIST_L2, 5)
+        px = np.round(pp.project(pp.P).numpy()).astype(int)
+        inside = (px[:, 0] >= 0) & (px[:, 0] < w) & (px[:, 1] >= 0) & (px[:, 1] < h)
+        mpp = float(np.median(P[:, 2])) / pp.view["focal"]
+        near = np.zeros(len(P), bool)
+        near[inside] = to_outline[px[inside, 1], px[inside, 0]] * mpp < 0.04
+        return np.clip((graze - 0.6) / 0.3, 0, 1) * near
+
     def correspond(self, vertices_np, normals_np):
         """Pair every Anny vertex with a point of the neutral SAM body (position and
         surface direction), so it can be carried into the photo."""
@@ -457,6 +503,13 @@ class SilhouetteLoss:
             first = np.r_[True, rs[1:] != rs[:-1]]; last = np.r_[rs[1:] != rs[:-1], True]
             left_ok[rs[first]], right_ok[rs[last]] = flags[first], flags[last]
             self.row_side_ok = (torch.as_tensor(left_ok) & self.left_ok, torch.as_tensor(right_ok) & self.right_ok)
+            # ... and which of those extremes are upper arm or deltoid
+            arm = self._dense_flag(self.upper_arm).numpy()[valid][order]
+            left_arm, right_arm = np.zeros(n, bool), np.zeros(n, bool)
+            left_arm[rs[first]], right_arm[rs[last]] = arm[first], arm[last]
+            weigh = lambda is_arm: torch.as_tensor(np.where(is_arm, self.UPPER_ARM_WIDTH_WEIGHT, 1.0),
+                                                   dtype=torch.float32)
+            self.row_side_weight = (weigh(left_arm), weigh(right_arm))
         j, ok = self.edge_pair
         gap = (dense[j] - self.outline)[ok] * scale
         edge = (gap ** 2).sum(1).mean() if ok.any() else torch.zeros(())
@@ -475,8 +528,10 @@ class SilhouetteLoss:
         right, left = tau * soft_max(x / tau), -tau * soft_max(-x / tau)
         left_ok, right_ok = self.row_side_ok
         res = torch.cat([(left - self.left)[left_ok], (right - self.right)[right_ok]]) * scale
-        res = res[res.abs() < 0.06]             # further than 6 cm is a pose mismatch, not a width
-        width = (res ** 2).mean() if len(res) else torch.zeros(())
+        left_w, right_w = self.row_side_weight
+        weight = torch.cat([left_w[left_ok], right_w[right_ok]])
+        near = res.abs() < 0.06                 # further than 6 cm is a pose mismatch, not a width
+        width = (weight[near] * res[near] ** 2).mean() if near.any() else torch.zeros(())
 
         # soft overlap
         src = torch.where(dense_body[:, None], dense, dense.detach()) * self.g
@@ -537,16 +592,49 @@ def _vertex_normals(v, faces):
     return vn / (vn.norm(dim=1, keepdim=True) + 1e-12)
 
 
+def unseen_legs(view) -> set:
+    """Which leg segments the photo does not show: "thigh" if a knee is out of frame,
+    "calf" if an ankle is. Their shape in the SAM body is then a guess, not a reading."""
+    points = view.get("keypoints_2d")
+    if points is None:
+        return set()
+    w, h = view["size"]
+    out = lambda name: any(not (BORDER <= points[s + name][0] <= w - 1 - BORDER and
+                                BORDER <= points[s + name][1] <= h - 1 - BORDER) for s in ("left_", "right_"))
+    return {seg for seg, joint in (("thigh", "knee"), ("calf", "ankle")) if out(joint)}
+
+
+BORDER = 5                 # px: a joint this close to the photo's edge counts as out of frame
+LEG_PRIOR_WEIGHT = 60.0    # pull of the NHANES leg girths on legs the photo does not show
+LEG_MUSCLE_SLIDER = {"thigh": "upperleg-muscle-incr", "calf": "lowerleg-muscle-incr"}
+
+
 def fit_dense(anny_body: AnnyBody, target_v, target_faces, kp, sex, age, height_cm, weight_kg,
-              silhouette: SilhouetteLoss | None = None, joint_steps=120, surface_steps=450, log=None):
+              silhouette: SilhouetteLoss | None = None, joint_steps=120, surface_steps=450, log=None,
+              unseen=(), bf_model=None):
     """Fit Anny to a neutral-pose target mesh and, if given, the photo silhouette.
-    Returns a dict with dials, local, pose, trans, surface_error_mm and report."""
+    Returns a dict with dials, local, pose, trans, surface_error_mm and report.
+
+    unseen: leg segments the photo does not show (unseen_legs). The SAM body is barely
+    trusted there. Instead the legs go with the rest of the person: their muscle follows
+    the muscle fitted on the arms, and their girths are pulled to what NHANES people of
+    this height, weight, age, waist and upper arm have (needs bf_model)."""
     target = trimesh.Trimesh(target_v, target_faces, process=False)
     keep = _body_keep(target_v, kp)
     T = torch.tensor(target_v[keep], dtype=torch.float32)
     Tn = torch.tensor(np.asarray(target.vertex_normals)[keep], dtype=torch.float32)
     # One photo shows width, not depth: trust the SAM skin less where it faces front/back.
     trust = 1.0 - 0.85 * Tn[:, 1].abs()
+    # ... and where the photo's skin outline measures the body's sides directly, trust
+    # SAM's guess at those sides much less.
+    if silhouette is not None:
+        trust = trust * (1.0 - 0.9 * torch.as_tensor(silhouette.sam_side_share()[keep], dtype=torch.float32))
+    side = lambda name: 0.5 * (kp["left_" + name][2] + kp["right_" + name][2])
+    spans = {"thigh": (side("knee"), side("hip")), "calf": (side("ankle"), side("knee"))}
+    for seg in unseen:
+        lo, hi = spans[seg]
+        trust = torch.where((T[:, 2] > lo) & (T[:, 2] <= hi), 0.15 * trust, trust)
+    leg_marks = None
     tree_T = cKDTree(T.numpy())
     mask, faces = anny_body.fit_mask, anny_body.faces
     joint_targets = {bone + s: torch.tensor(kp[side + "_" + name], dtype=torch.float32)
@@ -625,7 +713,26 @@ def fit_dense(anny_body: AnnyBody, target_v, target_faces, kp, sex, age, height_
             + 10.0 * (body["natural_height_m"] - height_cm / 100.0) ** 2
         if silhouette is not None:
             photo = silhouette(pv, refresh)
-            loss = loss + 1e4 * (photo["inside"] + photo["edge"] + photo["width"]) + 25.0 * photo["iou"]
+            # The overlap is measured on a coarse, blurred image of the body. The blur
+            # spreads the edge outwards, so near the end it would pull limbs a couple of
+            # pixels thinner than the photo. It places the body early on, then fades out
+            # and the sharp edge and width terms set the final widths.
+            iou_weight = 25.0 * float(np.clip((0.7 - step / surface_steps) / 0.3, 0.0, 1.0))
+            loss = loss + 1e4 * (photo["inside"] + photo["edge"] + photo["width"]) + iou_weight * photo["iou"]
+        if unseen:
+            arms = torch.stack([local[k] / reach[k] for k in ("upperarm-muscle-incr", "lowerarm-muscle-incr")]).mean().detach()
+            for seg in unseen:
+                k = LEG_MUSCLE_SLIDER[seg]
+                loss = loss + 2.0 * (local[k] / reach[k] - arms) ** 2
+            if bf_model is not None:
+                if leg_marks is None or step % 25 == 0:
+                    leg_marks = anny_body.landmarks(body, full=True)
+                g = anny_body.measure(body, leg_marks, full=True)
+                typical = stage3.legs_from_upper(bf_model, sex, age, height_cm, weight_kg,
+                                                 float(g["waist_iliac"]), float(g["bicep"]))
+                for seg, key in (("thigh", "thigh_mid"), ("calf", "calf")):
+                    if seg in unseen:
+                        loss = loss + LEG_PRIOR_WEIGHT * ((g[key] - typical[key]) / typical[key]) ** 2
         loss.backward(); opt.step()
         gap = float((plane1.abs().mean() + plane2.abs().mean()).detach() / 2) * 1000
         if log and (step % 50 == 0 or step == surface_steps - 1):
@@ -646,7 +753,7 @@ def fit_dense(anny_body: AnnyBody, target_v, target_faces, kp, sex, age, height_
 
 
 def fit_from_photos(sam: SamBody, anny_body: AnnyBody, bf_model, images_rgb, height_cm,
-                    weight_kg, sex, age, log=None) -> dict:
+                    weight_kg, sex, age, log=None, cutout=None) -> dict:
     """Photos -> fitted Anny body. `sam` is released part-way through, so pass a fresh
     SamBody() each time. Returns a dict:
     dials, local (shape, muscle and definition sliders), body (rest pose),
@@ -656,16 +763,30 @@ def fit_from_photos(sam: SamBody, anny_body: AnnyBody, bf_model, images_rgb, hei
     shape, scale, view = sam.shape_from_photos(images_rgb)
     v, kp, factor = sam.neutral_body(shape, scale, height_cm)
     sam.release()  # the big model is not needed again; make room for the next steps
-    photo_girths = measure_generic(v, sam.faces, kp, sex)
-    mask = person_mask(images_rgb[0])
-    photo_pose = PhotoPose(view, v, sam.faces, factor, _body_keep(v, kp))
-    skin, face_colour = skin_mask(images_rgb[0], mask, photo_pose, kp)
-    fit = fit_dense(anny_body, v, sam.faces, kp, sex, age, height_cm, weight_kg,
-                    silhouette=SilhouetteLoss(photo_pose, mask, skin, anny_body), log=log)
+    return fit_from_neutral(anny_body, bf_model, images_rgb[0], view, v, sam.faces, kp, factor,
+                            height_cm, weight_kg, sex, age, log, cutout)
+
+
+def fit_from_neutral(anny_body: AnnyBody, bf_model, image_rgb, view, v, faces, kp, factor,
+                     height_cm, weight_kg, sex, age, log=None, cutout=None) -> dict:
+    """Everything in fit_from_photos after SAM has read the photo. view, v, kp and
+    factor are what SamBody.shape_from_photos and neutral_body returned; faces are SAM's."""
+    photo_girths = measure_generic(v, faces, kp, sex)
+    # cutout: the front photo's own see-through background, if it has one (decode_cutout)
+    mask = cutout if cutout is not None else person_mask(image_rgb)
+    photo_pose = PhotoPose(view, v, faces, factor, _body_keep(v, kp))
+    skin, face_colour = skin_mask(image_rgb, mask, photo_pose, kp)
+    unseen = unseen_legs(view)
+    if log and unseen:
+        log("Not in the photo: " + ", ".join(sorted(unseen)) + ". Those follow the upper body and NHANES.")
+    fit = fit_dense(anny_body, v, faces, kp, sex, age, height_cm, weight_kg,
+                    silhouette=SilhouetteLoss(photo_pose, mask, skin, anny_body), log=log,
+                    unseen=unseen, bf_model=bf_model)
     with torch.no_grad():
         smooth = anny_body.build(sex, age, height_cm, fit["dials"], fit["local"])
         girths = {k: float(x) for k, x in anny_body.measure(smooth).items()}
-        bf = stage3.estimate_bf(bf_model, sex, age, height_cm, float(smooth["mass_kg"]), girths)["bf_mid"]
+        bf = stage3.estimate_bf(bf_model, sex, age, height_cm, float(smooth["mass_kg"]), girths,
+                                muscle_dial=float(fit["dials"]["muscle"]))["bf_mid"]
         local = {**fit["local"], **{k: relief(sex, bf) for k in DEFINITION_LOCALS}}
         # The definition sliders change volume slightly, so re-set the fat dial for the weight.
         lo, hi = DIAL_RANGES["weight"]
@@ -681,7 +802,7 @@ def fit_from_photos(sam: SamBody, anny_body: AnnyBody, bf_model, images_rgb, hei
             "bf_mid": bf, "surface_error_mm": fit["surface_error_mm"], "report": fit["report"],
             "view": view, "neutral": (v, kp), "pose": fit["pose"], "trans": fit["trans"],
             "mask": mask, "skin": skin, "face_colour": face_colour, "photo_pose": photo_pose,
-            "posed_vertices": posed}
+            "posed_vertices": posed, "unseen": sorted(unseen)}
 
 
 def save_mesh_npz(path, anny_body: AnnyBody, body, dials, local):

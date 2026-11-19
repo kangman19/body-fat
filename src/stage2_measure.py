@@ -82,6 +82,8 @@ GIRTH_KEYS = [
     "waist", "waist_iliac", "waist_navel",
     "hip", "thigh", "bicep", "calf", "chest", "wrist",
 ]
+# Further tapes, measured for display only (measure(..., full=True)). No solver uses them.
+EXTRA_GIRTH_KEYS = ["neck", "shoulders", "forearm", "thigh_mid", "ankle"]
 
 
 def age_to_dial(age_years: float) -> float:
@@ -129,10 +131,23 @@ class AnnyBody:
                     return name
             return "torso"
         self.vertex_part = np.array([part(m.bone_labels[int(i)]) for i in dominant])
+        # Left or right side of every vertex, from the bone it follows (limbs only).
+        self.vertex_left = is_left[dominant].numpy()
+        # How much of each vertex follows an upper-arm bone: above zero on the deltoid
+        # and armpit as well as on the arm itself.
+        is_upperarm = torch.tensor(["upperarm" in l for l in m.bone_labels])
+        self.upperarm_share = (m.vertex_bone_weights * is_upperarm[m.vertex_bone_indices]).sum(dim=1)
+        # How much of each vertex belongs to the head (1), fading down the neck (to 0).
+        share = lambda words: (m.vertex_bone_weights * torch.tensor(
+            [any(w in l for w in words) for l in m.bone_labels])[m.vertex_bone_indices]).sum(dim=1)
+        self.head_share = (share(("head", "eye")) + 0.75 * share(("neck03",)) + 0.5 * share(("neck02",))
+                           + 0.25 * share(("neck01",))).clamp(0, 1).numpy()
+        self._dominant = dominant
         self._local_labels = set(m.local_change_labels)
 
         f = self.faces
         self.edges_trunk = _unique_edges(f[~v_arm[f].any(dim=1)])  # torso + legs + head
+        self.edges_all = _unique_edges(f)
         self.edges_left_arm = _unique_edges(f[v_left_arm[f].all(dim=1)])
 
         # Navel vertex = the vertex Anny's own "navel out" slider moves the most.
@@ -144,6 +159,18 @@ class AnnyBody:
             )
             moved = (out["rest_vertices"] - base["rest_vertices"])[0].norm(dim=1)
         self.navel_vertex = int(moved.argmax())
+
+        # Face landmarks as groups of vertices (a landmark is the mean of its group), for
+        # lining the head up with another model's eyes, nose and ears.
+        rest = base["rest_vertices"][0].numpy()
+        head = np.where(self.vertex_part == "head")[0]
+        eye = lambda side: np.where((self._dominant == self.bone["eye." + side]).numpy())[0]
+        eye_z = float(rest[eye("L")][:, 2].mean())
+        centre = head[(np.abs(rest[head, 0]) < 0.004) & (rest[head, 2] < eye_z) & (rest[head, 2] > eye_z - 0.06)]
+        ear = lambda sign: head[sign * rest[head, 0] > (sign * rest[head, 0]).max() - 0.006]
+        self.face_landmarks = {"left_eye": eye("L"), "right_eye": eye("R"),
+                               "nose": centre[[int(np.argmin(rest[centre, 1]))]],
+                               "left_ear": ear(+1), "right_ear": ear(-1)}
 
     def _phenotype(self, sex, age, dials):
         p = {"gender": GENDER_DIAL[sex], "age": age_to_dial(age)}
@@ -222,9 +249,10 @@ class AnnyBody:
 
     # ------------------------------------------------------------------ measuring
 
-    def landmarks(self, body):
+    def landmarks(self, body, full=False):
         """Find where each tape goes. No gradients: positions are treated as fixed
-        while the girth at that position stays differentiable."""
+        while the girth at that position stays differentiable. full=True also places
+        the display-only tapes (EXTRA_GIRTH_KEYS)."""
         with torch.no_grad():
             v, j = body["vertices"], body["joints"]
             H = float(v[:, 2].max())
@@ -291,7 +319,36 @@ class AnnyBody:
             # Wrist: smallest girth at the end of the forearm.
             lm["wrist_t"] = arm_scan(el, wr, 0.80, 1.00, -1, 0.08)
             lm["crotch"] = crotch
+            if full:
+                # Forearm: greatest girth, square to the bone, in the upper half.
+                lm["forearm_t"] = arm_scan(el, wr, 0.08, 0.50, +1, 0.12)
+                # Neck: smallest girth square to the neck, between its base and the head.
+                base, head = j["neck01"], j["head"]
+                axis = (head - base) / (head - base).norm()
+                best = None
+                for t in np.linspace(0.15, 0.85, 12):
+                    g = self._girth_at(v, self.edges_trunk, base + float(t) * (head - base), axis, 0.12)
+                    if g is not None and (best is None or float(g) < best[0]):
+                        best = (float(g), float(t))
+                lm["neck_t"] = best[1] if best else 0.5
+                # Shoulders: one tape around both deltoids, level with the shoulder joints.
+                lm["shoulders"] = z("upperarm01.L")
+                # Mid thigh: halfway between the upper thigh tape and the knee.
+                lm["thigh_mid"] = 0.5 * (lm["thigh"] + z("lowerleg01.L"))
+                # Ankle: smallest girth of the lower leg, just above the ankle joint.
+                ankle, knee = z("foot.L"), z("lowerleg01.L")
+                lm["ankle"] = scan(ankle + 0.02 * (knee - ankle), ankle + 0.30 * (knee - ankle),
+                                   lambda p: -float(_hull_perimeter(p[:, :2])), keep=left)
+            lm["full"] = full
         return lm
+
+    @staticmethod
+    def _girth_at(v, edges, point, axis, radius):
+        pts = _slice(v, edges, point, axis)
+        pts = pts[(pts - point).norm(dim=1) < radius]
+        if len(pts) < 3:
+            return None
+        return _hull_perimeter(_to_plane(pts, point, axis))
 
     def _limb_girth(self, v, point, axis, radius):
         pts = _slice(v, self.edges_left_arm, point, axis)
@@ -300,9 +357,10 @@ class AnnyBody:
             return None
         return _hull_perimeter(_to_plane(pts, point, axis))
 
-    def measure(self, body, landmarks=None):
-        """Girths in millimetres (torch scalars, differentiable w.r.t. the vertices)."""
-        lm = landmarks or self.landmarks(body)
+    def measure(self, body, landmarks=None, full=False):
+        """Girths in millimetres (torch scalars, differentiable w.r.t. the vertices).
+        full=True adds EXTRA_GIRTH_KEYS."""
+        lm = landmarks or self.landmarks(body, full)
         v, j = body["vertices"], body["joints"]
         up = torch.tensor([0.0, 0.0, 1.0])
 
@@ -326,7 +384,22 @@ class AnnyBody:
             "bicep": self._limb_girth(v, (sh + lm["bicep_t"] * (el - sh)).detach(), upper_axis, 0.15),
             "wrist": self._limb_girth(v, (el + lm["wrist_t"] * (wr - el)).detach(), fore_axis, 0.08),
         }
-        return {k: g[k] * 1000.0 for k in GIRTH_KEYS}
+        if not full:
+            return {k: g[k] * 1000.0 for k in GIRTH_KEYS}
+        if not lm.get("full"):
+            lm = self.landmarks(body, True)
+        base, head = j["neck01"], j["head"]
+        neck_axis = ((head - base) / (head - base).norm()).detach()
+        around = _slice(v, self.edges_all, torch.tensor([0.0, 0.0, lm["shoulders"]]), up)
+        g.update({
+            "neck": self._girth_at(v, self.edges_trunk, (base + lm["neck_t"] * (head - base)).detach(),
+                                   neck_axis, 0.12),
+            "shoulders": _hull_perimeter(around[:, :2]),
+            "forearm": self._limb_girth(v, (el + lm["forearm_t"] * (wr - el)).detach(), fore_axis, 0.12),
+            "thigh_mid": horizontal(lm["thigh_mid"], left_only=True),
+            "ankle": horizontal(lm["ankle"], left_only=True),
+        })
+        return {k: g[k] * 1000.0 for k in GIRTH_KEYS + EXTRA_GIRTH_KEYS}
 
 
 # ---------------------------------------------------------------------- geometry
@@ -383,7 +456,7 @@ def measure_mesh_file(mesh_npz, height_cm, weight_kg, sex, age, out_json):
     anny_body = AnnyBody()
     with torch.no_grad():
         body = anny_body.build(sex, age, height_cm, params["dials"], params.get("local"))
-        girths = {k: round(float(x), 1) for k, x in anny_body.measure(body).items()}
+        girths = {k: round(float(x), 1) for k, x in anny_body.measure(body, full=True).items()}
     result = {
         "height_cm": float(height_cm), "weight_kg": float(weight_kg),
         "sex": sex, "age": int(age), "girths_mm": girths,
